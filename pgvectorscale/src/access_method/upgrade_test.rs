@@ -29,7 +29,9 @@ pub mod tests {
         extname: &str,
         amname: &str,
     ) {
-        if cfg!(feature = "pg17") && version != "0.4.0" {
+        if cfg!(feature = "pg17")
+            && semver::Version::parse(version).unwrap() < semver::Version::parse("0.4.0").unwrap()
+        {
             // PG17 was not supported before 0.4.0
             return;
         }
@@ -53,8 +55,14 @@ pub mod tests {
 
         // Convert the file path to an absolute path
         let current_dir = std::env::current_dir().unwrap();
-        let mut absolute_path = std::path::Path::new(&current_dir).join(current_file);
-        absolute_path = absolute_path.ancestors().nth(4).unwrap().to_path_buf();
+        let absolute_path_full = std::path::Path::new(&current_dir).join(current_file);
+        let mut absolute_path = None;
+        for ancestor in absolute_path_full.ancestors() {
+            if std::fs::exists(ancestor.join(".git")).unwrap() {
+                absolute_path = Some(ancestor.to_path_buf());
+            }
+        }
+        let absolute_path = absolute_path.expect("Couldn't find root directory");
 
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_path = temp_dir.path();
@@ -222,6 +230,12 @@ pub mod tests {
                 &[],
             )
             .unwrap();
+        client
+            .execute(
+                "CREATE INDEX idxtest_ip ON test USING diskann(embedding vector_ip_ops);",
+                &[],
+            )
+            .unwrap();
     }
 
     #[ignore]
@@ -256,5 +270,12 @@ pub mod tests {
     #[test]
     fn test_upgrade_from_0_4_0() {
         test_upgrade_base("0.4.0", "0.12.5", "pgvectorscale", "vectorscale", "diskann");
+    }
+
+    #[ignore]
+    #[serial]
+    #[test]
+    fn test_upgrade_from_0_5_0() {
+        test_upgrade_base("0.5.0", "0.12.5", "pgvectorscale", "vectorscale", "diskann");
     }
 }
