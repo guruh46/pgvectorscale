@@ -86,7 +86,6 @@ impl TSVIndexOptions {
     }
 }
 
-const NUM_REL_OPTS: usize = 6;
 static mut RELOPT_KIND_TSV: pg_sys::relopt_kind::Type = 0;
 
 // amoptions is a function that gets a datum of text[] data from pg_class.reloptions (which contains text in the format "key=value") and returns a bytea for the struct for the parsed options.
@@ -105,7 +104,7 @@ pub unsafe extern "C" fn amoptions(
     validate: bool,
 ) -> *mut pg_sys::bytea {
     // TODO:  how to make this const?  we can't use offset_of!() macro in const definitions, apparently
-    let tab: [pg_sys::relopt_parse_elt; NUM_REL_OPTS] = [
+    let tab: [pg_sys::relopt_parse_elt; 6] = [
         pg_sys::relopt_parse_elt {
             optname: "storage_layout".as_pg_cstr(),
             opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
@@ -138,13 +137,13 @@ pub unsafe extern "C" fn amoptions(
         },
     ];
 
-    build_relopts(reloptions, validate, tab)
+    build_relopts(reloptions, validate, &tab)
 }
 
 unsafe fn build_relopts(
     reloptions: pg_sys::Datum,
     validate: bool,
-    tab: [pg_sys::relopt_parse_elt; NUM_REL_OPTS],
+    tab: &[pg_sys::relopt_parse_elt],
 ) -> *mut pg_sys::bytea {
     /* Parse the user-given reloptions */
     let rdopts = pg_sys::build_reloptions(
@@ -153,7 +152,7 @@ unsafe fn build_relopts(
         RELOPT_KIND_TSV,
         std::mem::size_of::<TSVIndexOptions>(),
         tab.as_ptr(),
-        NUM_REL_OPTS as i32,
+        tab.len() as i32,
     );
 
     rdopts as *mut pg_sys::bytea
@@ -181,7 +180,7 @@ pub unsafe fn init() {
     pg_sys::add_string_reloption(
         RELOPT_KIND_TSV,
         "storage_layout".as_pg_cstr(),
-        "Storage layout: either memory_optimized, io_optimized, or plain".as_pg_cstr(),
+        "Storage layout: either memory_optimized or plain".as_pg_cstr(),
         super::storage::DEFAULT_STORAGE_TYPE_STR.as_pg_cstr(),
         Some(validate_storage_layout),
         pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
@@ -295,28 +294,6 @@ mod tests {
             options.bq_num_bits_per_dimension,
             SBQ_NUM_BITS_PER_DIMENSION_DEFAULT_SENTINEL,
         );
-        Ok(())
-    }
-
-    #[pg_test]
-    unsafe fn test_index_options_bq() -> spi::Result<()> {
-        Spi::run(
-            "CREATE TABLE test(encoding vector(3));
-        CREATE INDEX idxtest
-                  ON test
-               USING diskann(encoding)
-               WITH (storage_layout = io_optimized);",
-        )?;
-
-        let index_oid =
-            Spi::get_one::<pg_sys::Oid>("SELECT 'idxtest'::regclass::oid")?.expect("oid was null");
-        let indexrel = PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid));
-        let options = TSVIndexOptions::from_relation(&indexrel);
-        assert_eq!(options.get_num_neighbors(), NUM_NEIGHBORS_DEFAULT_SENTINEL);
-        assert_eq!(options.search_list_size, 100);
-        assert_eq!(options.max_alpha, DEFAULT_MAX_ALPHA);
-        assert_eq!(options.num_dimensions, NUM_DIMENSIONS_DEFAULT_SENTINEL);
-        assert_eq!(options.get_storage_type(), StorageType::SbqSpeedup);
         Ok(())
     }
 

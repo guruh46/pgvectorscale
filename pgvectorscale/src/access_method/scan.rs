@@ -4,7 +4,7 @@ use pgrx::{pg_sys::InvalidOffsetNumber, *};
 
 use crate::{
     access_method::{
-        graph_neighbor_store::GraphNeighborStore, meta_page::MetaPage, pg_vector::PgVector,
+        graph_neighbor_store::GraphNeighborStore, labels::LabeledVector, meta_page::MetaPage,
         sbq::SbqSpeedupStorage,
     },
     util::{buffer::PinnedBufferShare, ports::pgstat_count_index_scan, HeapPointer, IndexPointer},
@@ -13,6 +13,7 @@ use crate::{
 use super::{
     distance::DistanceFn,
     graph::{Graph, ListSearchResult},
+    labels::LabelSetView,
     plain_storage::{PlainDistanceMeasure, PlainStorage, PlainStorageLsnPrivateData},
     sbq::{SbqMeans, SbqQuantizer, SbqSearchDistanceMeasure, SbqSpeedupStorageLsnPrivateData},
     stats::QuantizerStats,
@@ -51,7 +52,7 @@ impl TSVScanState {
         &mut self,
         index: &PgRelation,
         heap: &PgRelation,
-        query: PgVector,
+        query: LabeledVector,
         search_list_size: usize,
     ) {
         let meta_page = MetaPage::fetch(index);
@@ -67,7 +68,7 @@ impl TSVScanState {
                     TSVResponseIterator::new(&bq, index, query, search_list_size, meta_page, stats);
                 StorageState::Plain(it)
             }
-            StorageType::SbqSpeedup | StorageType::SbqCompression => {
+            StorageType::SbqCompression => {
                 let mut stats = QuantizerStats::new();
                 let quantizer = unsafe { SbqMeans::load(index, &meta_page, &mut stats) };
                 let bq = SbqSpeedupStorage::load_for_search(index, heap, &quantizer, &meta_page);
@@ -138,6 +139,7 @@ impl StreamingStats {
         self.m2 += delta * delta2;
     }
 
+    #[allow(dead_code)]
     fn variance(&self) -> f32 {
         if self.count < 2 {
             return 0.0;
@@ -163,13 +165,14 @@ struct TSVResponseIterator<QDM, PD> {
     next_calls: i32,
     next_calls_with_resort: i32,
     full_distance_comparisons: i32,
+    has_label_filter: bool,
 }
 
 impl<QDM, PD> TSVResponseIterator<QDM, PD> {
     fn new<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
         storage: &S,
         index: &PgRelation,
-        query: PgVector,
+        query: LabeledVector,
         search_list_size: usize,
         //FIXME?
         _meta_page: MetaPage,
@@ -178,6 +181,7 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
         let mut meta_page = MetaPage::fetch(index);
         let graph = Graph::new(GraphNeighborStore::Disk, &mut meta_page);
 
+        let has_label_filter = query.labels().is_some_and(|labels| !labels.is_empty());
         let lsr = graph.greedy_search_streaming_init(query, search_list_size, storage);
         let resort_size = super::guc::TSV_RESORT_SIZE.get() as usize;
 
@@ -192,6 +196,7 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
             next_calls: 0,
             next_calls_with_resort: 0,
             full_distance_comparisons: 0,
+            has_label_filter,
         }
     }
 }
@@ -206,7 +211,13 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
 
         /* Iterate until we find a non-deleted tuple */
         loop {
-            graph.greedy_search_iterate(&mut self.lsr, self.search_list_size, None, storage);
+            graph.greedy_search_iterate(
+                &mut self.lsr,
+                self.search_list_size,
+                !self.has_label_filter,
+                None,
+                storage,
+            );
 
             let item = self.lsr.consume(storage);
 
@@ -236,11 +247,7 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
             return self.next(storage);
         }
 
-        while self.resort_buffer.len() < 2
-            || self.streaming_stats.count < 2
-            || (self.streaming_stats.max_distance - self.resort_buffer.peek().unwrap().distance)
-                < self.streaming_stats.variance().sqrt() * (self.resort_size as f32 / 100.0)
-        {
+        while self.resort_buffer.len() < self.resort_size {
             match self.next(storage) {
                 Some((heap_pointer, index_pointer)) => {
                     self.full_distance_comparisons += 1;
@@ -323,17 +330,14 @@ pub extern "C" fn ambeginscan(
 #[pg_guard]
 pub extern "C" fn amrescan(
     scan: pg_sys::IndexScanDesc,
-    _keys: pg_sys::ScanKey,
+    keys: pg_sys::ScanKey,
     nkeys: ::std::os::raw::c_int,
     orderbys: pg_sys::ScanKey,
     norderbys: ::std::os::raw::c_int,
 ) {
-    if norderbys == 0 {
-        panic!("No order by keys provided");
-    }
-    if norderbys > 1 {
-        panic!("Too many order by provided");
-    }
+    assert_eq!(norderbys, 1, "Expected a single order-by key");
+    assert!(nkeys == 0 || nkeys == 1, "Expected 0 or 1 keys");
+
     let mut scan: PgBox<pg_sys::IndexScanDescData> = unsafe { PgBox::from_pg(scan) };
     let indexrel = unsafe { PgRelation::from_pg(scan.indexRelation) };
     let heaprel = unsafe { PgRelation::from_pg(scan.heapRelation) };
@@ -345,19 +349,15 @@ pub extern "C" fn amrescan(
     let orderby_keys = unsafe {
         std::slice::from_raw_parts(orderbys as *const pg_sys::ScanKeyData, norderbys as _)
     };
+    let keys =
+        unsafe { std::slice::from_raw_parts(keys as *const pg_sys::ScanKeyData, nkeys as _) };
 
     let search_list_size = super::guc::TSV_QUERY_SEARCH_LIST_SIZE.get() as usize;
 
     let state = unsafe { (scan.opaque as *mut TSVScanState).as_mut() }.expect("no scandesc state");
 
-    let query = unsafe {
-        PgVector::from_datum(
-            orderby_keys[0].sk_argument,
-            &state.meta_page,
-            true, /* needed for search */
-            true, /* needed for resort */
-        )
-    };
+    let query = unsafe { LabeledVector::from_scan_key_data(keys, orderby_keys, &state.meta_page) };
+
     state.initialize(&indexrel, &heaprel, query, search_list_size);
 }
 
@@ -368,7 +368,6 @@ pub extern "C" fn amgettuple(
 ) -> bool {
     let scan: PgBox<pg_sys::IndexScanDescData> = unsafe { PgBox::from_pg(scan) };
     let state = unsafe { (scan.opaque as *mut TSVScanState).as_mut() }.expect("no scandesc state");
-    //let iter = unsafe { state.iterator.as_mut() }.expect("no iterator in state");
 
     let indexrel = unsafe { PgRelation::from_pg(scan.indexRelation) };
     let heaprel = unsafe { PgRelation::from_pg(scan.heapRelation) };
@@ -455,9 +454,6 @@ pub extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
 fn end_scan<S: Storage>(
     iter: &mut TSVResponseIterator<S::QueryDistanceMeasure, S::LSNPrivateData>,
 ) {
-    debug_assert!(iter.quantizer_stats.node_reads == 1);
-    debug_assert!(iter.quantizer_stats.node_writes == 0);
-
     debug1!(
         "Query stats - reads_index={} reads_heap={} d_total={} d_quantized={} d_full={} next={} resort={} visits={} candidate={}",
         iter.lsr.stats.get_node_reads(),
@@ -470,4 +466,7 @@ fn end_scan<S: Storage>(
         iter.lsr.stats.get_visited_nodes(),
         iter.lsr.stats.get_candidate_nodes(),
     );
+
+    debug_assert_eq!(iter.quantizer_stats.node_reads, 1);
+    debug_assert_eq!(iter.quantizer_stats.node_writes, 0);
 }

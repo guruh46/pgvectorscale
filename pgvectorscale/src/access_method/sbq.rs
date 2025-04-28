@@ -2,35 +2,34 @@ use super::{
     distance::{distance_xor_optimized, DistanceFn},
     graph::{ListSearchNeighbor, ListSearchResult},
     graph_neighbor_store::GraphNeighborStore,
+    labels::{LabelSet, LabelSetView, LabeledVector},
     neighbor_with_distance::DistanceWithTieBreak,
     pg_vector::PgVector,
+    sbq_node::{ArchivedSbqNode, SbqNode},
     stats::{
         GreedySearchStats, StatsDistanceComparison, StatsHeapNodeRead, StatsNodeModify,
         StatsNodeRead, StatsNodeWrite, WriteStats,
     },
-    storage::{ArchivedData, NodeDistanceMeasure, Storage},
-    storage_common::get_attribute_number_from_index,
+    storage::{NodeDistanceMeasure, Storage},
+    storage_common::get_index_vector_attribute,
 };
-use std::{cell::RefCell, collections::HashMap, iter::once, marker::PhantomData, pin::Pin};
+use std::{cell::RefCell, collections::HashMap, iter::once, marker::PhantomData};
 
-use pgrx::{
-    pg_sys::{InvalidBlockNumber, InvalidOffsetNumber, BLCKSZ},
-    PgBox, PgRelation,
-};
-use rkyv::{vec::ArchivedVec, Archive, Deserialize, Serialize};
+use pgrx::{pg_sys::AttrNumber, PgBox, PgRelation};
+use rkyv::{Archive, Deserialize, Serialize};
 
+use super::{meta_page::MetaPage, neighbor_with_distance::NeighborWithDistance};
+use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::util::{
     chain::{ChainItemReader, ChainTapeWriter},
     page::{PageType, ReadablePage},
     table_slot::TableSlot,
     tape::Tape,
-    ArchivedItemPointer, HeapPointer, IndexPointer, ItemPointer, ReadableBuffer,
+    HeapPointer, IndexPointer, ItemPointer, ReadableBuffer, WritableBuffer,
 };
+use pgvectorscale_derive::{Readable, Writeable};
 
-use super::{meta_page::MetaPage, neighbor_with_distance::NeighborWithDistance};
-use crate::util::WritableBuffer;
-
-type SbqVectorElement = u64;
+pub type SbqVectorElement = u64;
 const BITS_STORE_TYPE_SIZE: usize = 64;
 
 #[derive(Archive, Deserialize, Serialize, Readable, Writeable)]
@@ -90,7 +89,7 @@ pub struct SbqMeans {
 impl SbqMeans {
     pub unsafe fn load<S: StatsNodeRead>(
         index: &PgRelation,
-        meta_page: &super::meta_page::MetaPage,
+        meta_page: &MetaPage,
         stats: &mut S,
     ) -> SbqQuantizer {
         let mut quantizer = SbqQuantizer::new(meta_page);
@@ -149,7 +148,7 @@ pub struct SbqQuantizer {
 }
 
 impl SbqQuantizer {
-    fn new(meta_page: &super::meta_page::MetaPage) -> SbqQuantizer {
+    fn new(meta_page: &MetaPage) -> SbqQuantizer {
         Self {
             use_mean: true,
             training: false,
@@ -166,11 +165,11 @@ impl SbqQuantizer {
         self.m2 = m2
     }
 
-    fn quantized_size(&self, full_vector_size: usize) -> usize {
+    pub fn quantized_size(&self, full_vector_size: usize) -> usize {
         Self::quantized_size_internal(full_vector_size, self.num_bits_per_dimension)
     }
 
-    fn quantized_size_internal(full_vector_size: usize, num_bits_per_dimension: u8) -> usize {
+    pub fn quantized_size_internal(full_vector_size: usize, num_bits_per_dimension: u8) -> usize {
         let num_bits = full_vector_size * num_bits_per_dimension as usize;
 
         if num_bits % BITS_STORE_TYPE_SIZE == 0 {
@@ -180,7 +179,7 @@ impl SbqQuantizer {
         }
     }
 
-    fn quantized_size_bytes(num_dimensions: usize, num_bits_per_dimension: u8) -> usize {
+    pub fn quantized_size_bytes(num_dimensions: usize, num_bits_per_dimension: u8) -> usize {
         Self::quantized_size_internal(num_dimensions, num_bits_per_dimension)
             * std::mem::size_of::<SbqVectorElement>()
     }
@@ -237,7 +236,7 @@ impl SbqQuantizer {
         }
     }
 
-    fn start_training(&mut self, meta_page: &super::meta_page::MetaPage) {
+    fn start_training(&mut self, meta_page: &MetaPage) {
         self.training = true;
         if self.use_mean {
             self.count = 0;
@@ -289,7 +288,7 @@ impl SbqQuantizer {
 
     fn vector_for_new_node(
         &self,
-        _meta_page: &super::meta_page::MetaPage,
+        _meta_page: &MetaPage,
         full_vector: &[f32],
     ) -> Vec<SbqVectorElement> {
         self.quantize(full_vector)
@@ -298,22 +297,14 @@ impl SbqQuantizer {
 
 pub struct SbqSearchDistanceMeasure {
     quantized_vector: Vec<SbqVectorElement>,
-    query: PgVector,
-    num_dimensions_for_neighbors: usize,
-    quantized_dimensions: usize,
+    query: LabeledVector,
 }
 
 impl SbqSearchDistanceMeasure {
-    pub fn new(
-        quantizer: &SbqQuantizer,
-        query: PgVector,
-        num_dimensions_for_neighbors: usize,
-    ) -> SbqSearchDistanceMeasure {
+    pub fn new(quantizer: &SbqQuantizer, query: LabeledVector) -> SbqSearchDistanceMeasure {
         SbqSearchDistanceMeasure {
-            quantized_vector: quantizer.quantize(query.to_index_slice()),
+            quantized_vector: quantizer.quantize(query.vec().to_index_slice()),
             query,
-            num_dimensions_for_neighbors,
-            quantized_dimensions: quantizer.quantized_size(num_dimensions_for_neighbors),
         }
     }
 
@@ -327,22 +318,13 @@ impl SbqSearchDistanceMeasure {
         stats.record_quantized_distance_comparison();
         let (a, b) = match gns {
             GraphNeighborStore::Disk => {
-                if self.num_dimensions_for_neighbors > 0 {
-                    debug_assert!(self.quantized_vector.len() >= self.quantized_dimensions);
-                    debug_assert!(bq_vector.len() >= self.quantized_dimensions);
-                    (
-                        &self.quantized_vector.as_slice()[..self.quantized_dimensions],
-                        &bq_vector[..self.quantized_dimensions],
-                    )
-                } else {
-                    debug_assert!(
-                        self.quantized_vector.len() == bq_vector.len(),
-                        "self.quantized_vector.len()={} bq_vector.len()={}",
-                        self.quantized_vector.len(),
-                        bq_vector.len()
-                    );
-                    (self.quantized_vector.as_slice(), bq_vector)
-                }
+                debug_assert!(
+                    self.quantized_vector.len() == bq_vector.len(),
+                    "self.quantized_vector.len()={} bq_vector.len()={}",
+                    self.quantized_vector.len(),
+                    bq_vector.len()
+                );
+                (self.quantized_vector.as_slice(), bq_vector)
             }
             GraphNeighborStore::Builder(_b) => {
                 debug_assert!(
@@ -375,8 +357,9 @@ impl<'a> SbqNodeDistanceMeasure<'a> {
         stats: &mut T,
     ) -> Self {
         let cache = &mut storage.qv_cache.borrow_mut();
+        let vec = cache.get(index_pointer, storage, stats);
         Self {
-            vec: cache.get(index_pointer, storage, stats).to_vec(),
+            vec: vec.to_vec(),
             storage,
         }
     }
@@ -414,15 +397,13 @@ impl QuantizedVectorCache {
         storage: &SbqSpeedupStorage,
         stats: &mut S,
     ) -> &[SbqVectorElement] {
-        self.quantized_vector_map
+        let vec = self
+            .quantized_vector_map
             .entry(index_pointer)
             .or_insert_with(|| {
                 storage.get_quantized_vector_from_index_pointer(index_pointer, stats)
-            })
-    }
-
-    fn must_get(&self, index_pointer: IndexPointer) -> &[SbqVectorElement] {
-        self.quantized_vector_map.get(&index_pointer).unwrap()
+            });
+        vec.as_slice()
     }
 
     /* Ensure that all these elements are in the cache. If the capacity isn't big enough throw an error.
@@ -445,31 +426,31 @@ pub struct SbqSpeedupStorage<'a> {
     pub distance_fn: DistanceFn,
     quantizer: SbqQuantizer,
     heap_rel: &'a PgRelation,
-    heap_attr: pgrx::pg_sys::AttrNumber,
+    heap_attr: AttrNumber,
     qv_cache: RefCell<QuantizedVectorCache>,
-    num_dimensions_for_neighbors: usize,
+    has_labels: bool,
 }
 
 impl<'a> SbqSpeedupStorage<'a> {
     pub fn new_for_build(
         index: &'a PgRelation,
         heap_rel: &'a PgRelation,
-        meta_page: &super::meta_page::MetaPage,
+        meta_page: &MetaPage,
     ) -> SbqSpeedupStorage<'a> {
         Self {
             index,
             distance_fn: meta_page.get_distance_function(),
             quantizer: SbqQuantizer::new(meta_page),
             heap_rel,
-            heap_attr: get_attribute_number_from_index(index),
+            heap_attr: get_index_vector_attribute(index),
             qv_cache: RefCell::new(QuantizedVectorCache::new(1000)),
-            num_dimensions_for_neighbors: meta_page.get_num_dimensions_for_neighbors() as usize,
+            has_labels: meta_page.has_labels(),
         }
     }
 
     fn load_quantizer<S: StatsNodeRead>(
         index_relation: &PgRelation,
-        meta_page: &super::meta_page::MetaPage,
+        meta_page: &MetaPage,
         stats: &mut S,
     ) -> SbqQuantizer {
         unsafe { SbqMeans::load(index_relation, meta_page, stats) }
@@ -478,7 +459,7 @@ impl<'a> SbqSpeedupStorage<'a> {
     pub fn load_for_insert<S: StatsNodeRead>(
         heap_rel: &'a PgRelation,
         index_relation: &'a PgRelation,
-        meta_page: &super::meta_page::MetaPage,
+        meta_page: &MetaPage,
         stats: &mut S,
     ) -> SbqSpeedupStorage<'a> {
         Self {
@@ -486,9 +467,9 @@ impl<'a> SbqSpeedupStorage<'a> {
             distance_fn: meta_page.get_distance_function(),
             quantizer: Self::load_quantizer(index_relation, meta_page, stats),
             heap_rel,
-            heap_attr: get_attribute_number_from_index(index_relation),
+            heap_attr: get_index_vector_attribute(index_relation),
             qv_cache: RefCell::new(QuantizedVectorCache::new(1000)),
-            num_dimensions_for_neighbors: meta_page.get_num_dimensions_for_neighbors() as usize,
+            has_labels: meta_page.has_labels(),
         }
     }
 
@@ -496,7 +477,7 @@ impl<'a> SbqSpeedupStorage<'a> {
         index_relation: &'a PgRelation,
         heap_relation: &'a PgRelation,
         quantizer: &SbqQuantizer,
-        meta_page: &super::meta_page::MetaPage,
+        meta_page: &MetaPage,
     ) -> SbqSpeedupStorage<'a> {
         Self {
             index: index_relation,
@@ -504,9 +485,20 @@ impl<'a> SbqSpeedupStorage<'a> {
             //OPT: get rid of clone
             quantizer: quantizer.clone(),
             heap_rel: heap_relation,
-            heap_attr: get_attribute_number_from_index(index_relation),
+            heap_attr: get_index_vector_attribute(index_relation),
             qv_cache: RefCell::new(QuantizedVectorCache::new(1000)),
-            num_dimensions_for_neighbors: meta_page.get_num_dimensions_for_neighbors() as usize,
+            has_labels: meta_page.has_labels(),
+        }
+    }
+
+    fn write_quantizer_metadata<S: StatsNodeWrite + StatsNodeModify>(
+        &self,
+        meta_page: &mut MetaPage,
+        stats: &mut S,
+    ) {
+        if self.quantizer.use_mean {
+            let index_pointer = unsafe { SbqMeans::store(self.index, &self.quantizer, stats) };
+            meta_page.set_quantizer_metadata_pointer(index_pointer);
         }
     }
 
@@ -515,20 +507,9 @@ impl<'a> SbqSpeedupStorage<'a> {
         index_pointer: IndexPointer,
         stats: &mut S,
     ) -> Vec<SbqVectorElement> {
-        let rn = unsafe { SbqNode::read(self.index, index_pointer, stats) };
+        let rn = unsafe { SbqNode::read(self.index, index_pointer, self.has_labels, stats) };
         let node = rn.get_archived_node();
-        node.bq_vector.as_slice().to_vec()
-    }
-
-    fn write_quantizer_metadata<S: StatsNodeWrite + StatsNodeModify>(&self, stats: &mut S) {
-        if self.quantizer.use_mean {
-            let index_pointer = unsafe { SbqMeans::store(self.index, &self.quantizer, stats) };
-            super::meta_page::MetaPage::update_quantizer_metadata_pointer(
-                self.index,
-                index_pointer,
-                stats,
-            );
-        }
+        node.get_bq_vector().to_vec()
     }
 
     fn visit_lsn_internal(
@@ -539,67 +520,95 @@ impl<'a> SbqSpeedupStorage<'a> {
         >,
         lsn_index_pointer: IndexPointer,
         gns: &GraphNeighborStore,
+        no_filter: bool,
     ) {
         match gns {
             GraphNeighborStore::Disk => {
-                let rn_visiting =
-                    unsafe { SbqNode::read(self.index, lsn_index_pointer, &mut lsr.stats) };
+                let rn_visiting = unsafe {
+                    SbqNode::read(
+                        self.index,
+                        lsn_index_pointer,
+                        self.has_labels,
+                        &mut lsr.stats,
+                    )
+                };
                 let node_visiting = rn_visiting.get_archived_node();
                 //OPT: get neighbors from private data just like plain storage in the self.num_dimensions_for_neighbors == 0 case
                 let neighbors = node_visiting.get_index_pointer_to_neighbors();
 
-                for (i, &neighbor_index_pointer) in neighbors.iter().enumerate() {
+                for &neighbor_index_pointer in neighbors.iter() {
                     if !lsr.prepare_insert(neighbor_index_pointer) {
                         continue;
                     }
 
-                    let distance = if self.num_dimensions_for_neighbors > 0 {
-                        let bq_vector = node_visiting.neighbor_vectors[i].as_slice();
-                        lsr.sdm.as_ref().unwrap().calculate_bq_distance(
-                            bq_vector,
-                            gns,
-                            &mut lsr.stats,
-                        )
-                    } else {
-                        let rn_neighbor = unsafe {
-                            SbqNode::read(self.index, neighbor_index_pointer, &mut lsr.stats)
-                        };
-                        let node_neighbor = rn_neighbor.get_archived_node();
-                        let bq_vector = node_neighbor.bq_vector.as_slice();
-                        lsr.sdm.as_ref().unwrap().calculate_bq_distance(
-                            bq_vector,
-                            gns,
+                    let rn_neighbor = unsafe {
+                        SbqNode::read(
+                            self.index,
+                            neighbor_index_pointer,
+                            self.has_labels,
                             &mut lsr.stats,
                         )
                     };
+
+                    let node_neighbor = rn_neighbor.get_archived_node();
+
+                    // Skip neighbors that have no matching labels with the query
+                    if let Some(labels) = lsr.sdm.as_ref().expect("sdm is Some").query.labels() {
+                        if !no_filter
+                            && !labels
+                                .overlaps(node_neighbor.get_labels().expect("Unlabeled neighbor?"))
+                        {
+                            continue;
+                        }
+                    }
+
+                    let bq_vector = node_neighbor.get_bq_vector();
+                    let distance = lsr
+                        .sdm
+                        .as_ref()
+                        .expect("sdm is Some")
+                        .calculate_bq_distance(bq_vector, gns, &mut lsr.stats);
 
                     let lsn = ListSearchNeighbor::new(
                         neighbor_index_pointer,
                         lsr.create_distance_with_tie_break(distance, neighbor_index_pointer),
                         PhantomData::<bool>,
+                        node_neighbor.get_labels().map(Into::into),
                     );
 
                     lsr.insert_neighbor(lsn);
                 }
             }
             GraphNeighborStore::Builder(b) => {
-                let neighbors = b.get_neighbors(lsn_index_pointer);
-                for &neighbor_index_pointer in neighbors.iter() {
+                let mut neighbors: Vec<NeighborWithDistance> = Vec::new();
+                b.get_neighbors_with_full_vector_distances(lsn_index_pointer, &mut neighbors);
+                for neighbor in neighbors.iter() {
+                    let neighbor_index_pointer = neighbor.get_index_pointer_to_neighbor();
                     if !lsr.prepare_insert(neighbor_index_pointer) {
                         continue;
                     }
+
+                    // Skip neighbors that have no matching labels with the query
+                    if let Some(labels) = lsr.sdm.as_ref().expect("lsr.sdm is None").query.labels()
+                    {
+                        if !no_filter && !labels.overlaps(neighbor.get_labels().unwrap()) {
+                            continue;
+                        }
+                    }
+
                     let mut cache = self.qv_cache.borrow_mut();
                     let bq_vector = cache.get(neighbor_index_pointer, self, &mut lsr.stats);
-                    let distance = lsr.sdm.as_ref().unwrap().calculate_bq_distance(
-                        bq_vector,
-                        gns,
-                        &mut lsr.stats,
-                    );
+                    let distance = lsr
+                        .sdm
+                        .as_ref()
+                        .expect("lsr.sdm is None")
+                        .calculate_bq_distance(bq_vector, gns, &mut lsr.stats);
 
                     let lsn = ListSearchNeighbor::new(
                         neighbor_index_pointer,
                         lsr.create_distance_with_tie_break(distance, neighbor_index_pointer),
                         PhantomData::<bool>,
+                        neighbor.get_labels().cloned(),
                     );
 
                     lsr.insert_neighbor(lsn);
@@ -609,15 +618,16 @@ impl<'a> SbqSpeedupStorage<'a> {
     }
 }
 
-pub type SbqSpeedupStorageLsnPrivateData = PhantomData<bool>; //no data stored
-
 impl Storage for SbqSpeedupStorage<'_> {
     type QueryDistanceMeasure = SbqSearchDistanceMeasure;
-    type NodeDistanceMeasure<'b>
-        = SbqNodeDistanceMeasure<'b>
+    type NodeDistanceMeasure<'a>
+        = SbqNodeDistanceMeasure<'a>
+    where
+        Self: 'a;
+    type ArchivedType<'b>
+        = ArchivedSbqNode<'b>
     where
         Self: 'b;
-    type ArchivedType = ArchivedSbqNode;
     type LSNPrivateData = SbqSpeedupStorageLsnPrivateData; //no data stored
 
     fn page_type() -> PageType {
@@ -627,6 +637,7 @@ impl Storage for SbqSpeedupStorage<'_> {
     fn create_node<S: StatsNodeWrite>(
         &self,
         full_vector: &[f32],
+        labels: Option<LabelSet>,
         heap_pointer: HeapPointer,
         meta_page: &MetaPage,
         tape: &mut Tape,
@@ -634,18 +645,13 @@ impl Storage for SbqSpeedupStorage<'_> {
     ) -> ItemPointer {
         let bq_vector = self.quantizer.vector_for_new_node(meta_page, full_vector);
 
-        let node = SbqNode::with_meta(
-            &self.quantizer,
-            heap_pointer,
-            meta_page,
-            bq_vector.as_slice(),
-        );
+        let node = SbqNode::with_meta(heap_pointer, meta_page, bq_vector.as_slice(), labels);
 
         let index_pointer: IndexPointer = node.write(tape, stats);
         index_pointer
     }
 
-    fn start_training(&mut self, meta_page: &super::meta_page::MetaPage) {
+    fn start_training(&mut self, meta_page: &MetaPage) {
         self.quantizer.start_training(meta_page);
     }
 
@@ -653,9 +659,9 @@ impl Storage for SbqSpeedupStorage<'_> {
         self.quantizer.add_sample(sample);
     }
 
-    fn finish_training(&mut self, stats: &mut WriteStats) {
+    fn finish_training(&mut self, meta_page: &mut MetaPage, stats: &mut WriteStats) {
         self.quantizer.finish_training();
-        self.write_quantizer_metadata(stats);
+        self.write_quantizer_metadata(meta_page, stats);
     }
 
     fn finalize_node_at_end_of_build<S: StatsNodeRead + StatsNodeModify>(
@@ -674,9 +680,10 @@ impl Storage for SbqSpeedupStorage<'_> {
             .chain(once(index_pointer));
         cache.preload(iter, self, stats);
 
-        let mut node = unsafe { SbqNode::modify(self.index, index_pointer, stats) };
+        let mut node =
+            unsafe { SbqNode::modify(self.index, index_pointer, self.has_labels, stats) };
         let mut archived = node.get_archived_node();
-        archived.as_mut().set_neighbors(neighbors, meta, &cache);
+        archived.set_neighbors(neighbors, meta);
 
         node.commit();
     }
@@ -689,8 +696,8 @@ impl Storage for SbqSpeedupStorage<'_> {
         SbqNodeDistanceMeasure::with_index_pointer(self, index_pointer, stats)
     }
 
-    fn get_query_distance_measure(&self, query: PgVector) -> SbqSearchDistanceMeasure {
-        SbqSearchDistanceMeasure::new(&self.quantizer, query, self.num_dimensions_for_neighbors)
+    fn get_query_distance_measure(&self, query: LabeledVector) -> SbqSearchDistanceMeasure {
+        SbqSearchDistanceMeasure::new(&self.quantizer, query)
     }
 
     fn get_full_distance_for_resort<S: StatsHeapNodeRead + StatsDistanceComparison>(
@@ -715,7 +722,7 @@ impl Storage for SbqSpeedupStorage<'_> {
         let vec = unsafe { PgVector::from_datum(datum, meta_page, false, true) };
         Some(self.get_distance_function()(
             vec.to_full_slice(),
-            qdm.query.to_full_slice(),
+            qdm.query.vec().to_full_slice(),
         ))
     }
 
@@ -725,48 +732,52 @@ impl Storage for SbqSpeedupStorage<'_> {
         result: &mut Vec<NeighborWithDistance>,
         stats: &mut S,
     ) {
-        let rn = unsafe { SbqNode::read(self.index, neighbors_of, stats) };
+        let rn = unsafe { SbqNode::read(self.index, neighbors_of, self.has_labels, stats) };
         let archived = rn.get_archived_node();
-        let q = archived.bq_vector.as_slice();
+        let q = archived.get_bq_vector();
 
         for n in rn.get_archived_node().iter_neighbors() {
             //OPT: we can optimize this if num_dimensions_for_neighbors == num_dimensions_to_index
-            let rn1 = unsafe { SbqNode::read(self.index, n, stats) };
+            let rn1 = unsafe { SbqNode::read(self.index, n, self.has_labels, stats) };
+            let arch = rn1.get_archived_node();
             stats.record_quantized_distance_comparison();
-            let dist = distance_xor_optimized(q, rn1.get_archived_node().bq_vector.as_slice());
+            let dist = distance_xor_optimized(q, arch.get_bq_vector());
             result.push(NeighborWithDistance::new(
                 n,
                 DistanceWithTieBreak::new(dist as f32, neighbors_of, n),
+                arch.get_labels().map(Into::into),
             ))
         }
     }
 
     /* get_lsn and visit_lsn are different because the distance
     comparisons for SBQ get the vector from different places */
-    fn create_lsn_for_init_id(
+    fn create_lsn_for_start_node(
         &self,
         lsr: &mut ListSearchResult<Self::QueryDistanceMeasure, Self::LSNPrivateData>,
         index_pointer: ItemPointer,
         gns: &GraphNeighborStore,
-    ) -> ListSearchNeighbor<Self::LSNPrivateData> {
+    ) -> Option<ListSearchNeighbor<Self::LSNPrivateData>> {
         if !lsr.prepare_insert(index_pointer) {
-            panic!("should not have had an init id already inserted");
+            // Already processed this start node
+            return None;
         }
 
-        let rn = unsafe { SbqNode::read(self.index, index_pointer, &mut lsr.stats) };
+        let rn =
+            unsafe { SbqNode::read(self.index, index_pointer, self.has_labels, &mut lsr.stats) };
         let node = rn.get_archived_node();
-
         let distance = lsr.sdm.as_ref().unwrap().calculate_bq_distance(
-            node.bq_vector.as_slice(),
+            node.get_bq_vector(),
             gns,
             &mut lsr.stats,
         );
 
-        ListSearchNeighbor::new(
+        Some(ListSearchNeighbor::new(
             index_pointer,
             lsr.create_distance_with_tie_break(distance, index_pointer),
             PhantomData::<bool>,
-        )
+            node.get_labels().map(Into::into),
+        ))
     }
 
     fn visit_lsn(
@@ -774,9 +785,10 @@ impl Storage for SbqSpeedupStorage<'_> {
         lsr: &mut ListSearchResult<Self::QueryDistanceMeasure, Self::LSNPrivateData>,
         lsn_idx: usize,
         gns: &GraphNeighborStore,
+        no_filter: bool,
     ) {
         let lsn_index_pointer = lsr.get_lsn_by_idx(lsn_idx).index_pointer;
-        self.visit_lsn_internal(lsr, lsn_index_pointer, gns);
+        self.visit_lsn_internal(lsr, lsn_index_pointer, gns, no_filter);
     }
 
     fn return_lsn(
@@ -785,10 +797,10 @@ impl Storage for SbqSpeedupStorage<'_> {
         stats: &mut GreedySearchStats,
     ) -> HeapPointer {
         let lsn_index_pointer = lsn.index_pointer;
-        let rn = unsafe { SbqNode::read(self.index, lsn_index_pointer, stats) };
+        let rn = unsafe { SbqNode::read(self.index, lsn_index_pointer, self.has_labels, stats) };
         let node = rn.get_archived_node();
 
-        node.heap_item_pointer.deserialize_item_pointer()
+        node.get_heap_item_pointer()
     }
 
     fn set_neighbors_on_disk<S: StatsNodeModify + StatsNodeRead>(
@@ -808,222 +820,32 @@ impl Storage for SbqSpeedupStorage<'_> {
             .chain(once(index_pointer));
         cache.preload(iter, self, stats);
 
-        let mut node = unsafe { SbqNode::modify(self.index, index_pointer, stats) };
+        let mut node =
+            unsafe { SbqNode::modify(self.index, index_pointer, self.has_labels, stats) };
         let mut archived = node.get_archived_node();
-        archived.as_mut().set_neighbors(neighbors, meta, &cache);
+        archived.set_neighbors(neighbors, meta);
         node.commit();
     }
 
     fn get_distance_function(&self) -> DistanceFn {
         self.distance_fn
     }
-}
 
-use pgvectorscale_derive::{Readable, Writeable};
-
-#[derive(Archive, Deserialize, Serialize, Readable, Writeable)]
-#[archive(check_bytes)]
-pub struct SbqNode {
-    pub heap_item_pointer: HeapPointer,
-    pub bq_vector: Vec<u64>, //don't use SbqVectorElement because we don't want to change the size in on-disk format by accident
-    neighbor_index_pointers: Vec<ItemPointer>,
-    neighbor_vectors: Vec<Vec<u64>>, //don't use SbqVectorElement because we don't want to change the size in on-disk format by accident
-}
-
-impl SbqNode {
-    pub fn with_meta(
-        quantizer: &SbqQuantizer,
-        heap_pointer: HeapPointer,
-        meta_page: &MetaPage,
-        bq_vector: &[SbqVectorElement],
-    ) -> Self {
-        Self::new(
-            heap_pointer,
-            meta_page.get_num_neighbors() as usize,
-            meta_page.get_num_dimensions_to_index() as usize,
-            meta_page.get_num_dimensions_for_neighbors() as usize,
-            quantizer.num_bits_per_dimension,
-            bq_vector,
-        )
-    }
-
-    fn new(
-        heap_pointer: HeapPointer,
-        num_neighbors: usize,
-        _num_dimensions: usize,
-        num_dimensions_for_neighbors: usize,
-        num_bits_per_dimension: u8,
-        bq_vector: &[SbqVectorElement],
-    ) -> Self {
-        // always use vectors of num_neighbors in length because we never want the serialized size of a Node to change
-        let neighbor_index_pointers: Vec<_> = (0..num_neighbors)
-            .map(|_| ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber))
-            .collect();
-
-        let neighbor_vectors: Vec<_> = if num_dimensions_for_neighbors > 0 {
-            (0..num_neighbors)
-                .map(|_| {
-                    vec![
-                        0;
-                        SbqQuantizer::quantized_size_internal(
-                            num_dimensions_for_neighbors as _,
-                            num_bits_per_dimension
-                        )
-                    ]
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-
-        Self {
-            heap_item_pointer: heap_pointer,
-            bq_vector: bq_vector.to_vec(),
-            neighbor_index_pointers,
-            neighbor_vectors,
+    fn get_labels<S: StatsNodeRead>(
+        &self,
+        index_pointer: IndexPointer,
+        stats: &mut S,
+    ) -> Option<LabelSet> {
+        if !self.has_labels {
+            return None;
         }
-    }
-
-    fn test_size(
-        num_neighbors: usize,
-        num_dimensions: usize,
-        num_dimensions_for_neighbors: usize,
-        num_bits_per_dimension: u8,
-    ) -> usize {
-        let v: Vec<SbqVectorElement> =
-            vec![0; SbqQuantizer::quantized_size_internal(num_dimensions, num_bits_per_dimension)];
-        let hp = HeapPointer::new(InvalidBlockNumber, InvalidOffsetNumber);
-        let n = Self::new(
-            hp,
-            num_neighbors,
-            num_dimensions,
-            num_dimensions_for_neighbors,
-            num_bits_per_dimension,
-            &v,
-        );
-        n.serialize_to_vec().len()
-    }
-
-    pub fn get_default_num_neighbors(
-        num_dimensions: usize,
-        num_dimensions_for_neighbors: usize,
-        num_bits_per_dimension: u8,
-    ) -> usize {
-        //how many neighbors can fit on one page? That's what we choose.
-
-        //we first overapproximate the number of neighbors and then double check by actually calculating the size of the SbqNode.
-
-        //blocksize - 100 bytes for the padding/header/etc.
-        let page_size = BLCKSZ as usize - 50;
-        //one quantized_vector takes this many bytes
-        let vec_size =
-            SbqQuantizer::quantized_size_bytes(num_dimensions, num_bits_per_dimension) + 1;
-        //start from the page size then subtract the heap_item_pointer and bq_vector elements of SbqNode.
-        let starting = BLCKSZ as usize - std::mem::size_of::<HeapPointer>() - vec_size;
-        //one neigbors contribution to neighbor_index_pointers + neighbor_vectors in SbqNode.
-        let one_neighbor = vec_size + std::mem::size_of::<ItemPointer>();
-
-        let mut num_neighbors_overapproximate: usize = starting / one_neighbor;
-        while num_neighbors_overapproximate > 0 {
-            let serialized_size = SbqNode::test_size(
-                num_neighbors_overapproximate,
-                num_dimensions,
-                num_dimensions_for_neighbors,
-                num_bits_per_dimension,
-            );
-            if serialized_size <= page_size {
-                return num_neighbors_overapproximate;
-            }
-            num_neighbors_overapproximate -= 1;
-        }
-        pgrx::error!(
-            "Could not find a valid number of neighbors for the default value. Please specify one."
-        );
+        let rn = unsafe { SbqNode::read(self.index, index_pointer, true, stats) };
+        let node = rn.get_archived_node();
+        node.get_labels().map(Into::into)
     }
 }
 
-impl ArchivedSbqNode {
-    fn neighbor_index_pointer(self: Pin<&mut Self>) -> Pin<&mut ArchivedVec<ArchivedItemPointer>> {
-        unsafe { self.map_unchecked_mut(|s| &mut s.neighbor_index_pointers) }
-    }
-
-    fn neighbor_vector(self: Pin<&mut Self>) -> Pin<&mut ArchivedVec<ArchivedVec<u64>>> {
-        unsafe { self.map_unchecked_mut(|s| &mut s.neighbor_vectors) }
-    }
-
-    fn set_neighbors(
-        mut self: Pin<&mut Self>,
-        neighbors: &[NeighborWithDistance],
-        meta_page: &MetaPage,
-        cache: &QuantizedVectorCache,
-    ) {
-        for (i, new_neighbor) in neighbors.iter().enumerate() {
-            let mut a_index_pointer = self.as_mut().neighbor_index_pointer().index_pin(i);
-            let ip = new_neighbor.get_index_pointer_to_neighbor();
-            //TODO hate that we have to set each field like this
-            a_index_pointer.block_number = ip.block_number;
-            a_index_pointer.offset = ip.offset;
-
-            if meta_page.get_num_dimensions_for_neighbors() > 0 {
-                let quantized = &cache.must_get(ip)[..SbqQuantizer::quantized_size_internal(
-                    meta_page.get_num_dimensions_for_neighbors() as _,
-                    meta_page.get_bq_num_bits_per_dimension(),
-                )];
-                let mut neighbor_vector = self.as_mut().neighbor_vector().index_pin(i);
-                for (index_in_q_vec, val) in quantized.iter().enumerate() {
-                    let mut x = neighbor_vector.as_mut().index_pin(index_in_q_vec);
-                    *x = *val;
-                }
-            }
-        }
-        //set the marker that the list ended
-        if neighbors.len() < meta_page.get_num_neighbors() as _ {
-            let mut past_last_index_pointers =
-                self.neighbor_index_pointer().index_pin(neighbors.len());
-            past_last_index_pointers.block_number = InvalidBlockNumber;
-            past_last_index_pointers.offset = InvalidOffsetNumber;
-        }
-    }
-
-    pub fn num_neighbors(&self) -> usize {
-        self.neighbor_index_pointers
-            .iter()
-            .position(|f| f.block_number == InvalidBlockNumber)
-            .unwrap_or(self.neighbor_index_pointers.len())
-    }
-
-    pub fn iter_neighbors(&self) -> impl Iterator<Item = ItemPointer> + '_ {
-        self.neighbor_index_pointers
-            .iter()
-            .take(self.num_neighbors())
-            .map(|ip| ip.deserialize_item_pointer())
-    }
-}
-
-impl ArchivedData for ArchivedSbqNode {
-    fn with_data(data: &mut [u8]) -> Pin<&mut ArchivedSbqNode> {
-        ArchivedSbqNode::with_data(data)
-    }
-
-    fn get_index_pointer_to_neighbors(&self) -> Vec<ItemPointer> {
-        self.iter_neighbors().collect()
-    }
-
-    fn is_deleted(&self) -> bool {
-        self.heap_item_pointer.offset == InvalidOffsetNumber
-    }
-
-    fn delete(self: Pin<&mut Self>) {
-        //TODO: actually optimize the deletes by removing index tuples. For now just mark it.
-        let mut heap_pointer = unsafe { self.map_unchecked_mut(|s| &mut s.heap_item_pointer) };
-        heap_pointer.offset = InvalidOffsetNumber;
-        heap_pointer.block_number = InvalidBlockNumber;
-    }
-
-    fn get_heap_item_pointer(&self) -> HeapPointer {
-        self.heap_item_pointer.deserialize_item_pointer()
-    }
-}
+pub type SbqSpeedupStorageLsnPrivateData = PhantomData<bool>; //no data stored
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
@@ -1031,123 +853,6 @@ mod tests {
     use pgrx::*;
 
     use crate::access_method::distance::DistanceType;
-
-    #[pg_test]
-    unsafe fn test_bq_speedup_storage_index_creation_default_neighbors() -> spi::Result<()> {
-        crate::access_method::build::tests::test_index_creation_and_accuracy_scaffold(
-            DistanceType::Cosine,
-            "storage_layout = io_optimized",
-            "bq_speedup_default_neighbors",
-            1536,
-        )?;
-        Ok(())
-    }
-
-    #[pg_test]
-    unsafe fn test_bq_speedup_storage_index_creation_few_neighbors() -> spi::Result<()> {
-        //a test with few neighbors tests the case that nodes share a page, which has caused deadlocks in the past.
-        crate::access_method::build::tests::test_index_creation_and_accuracy_scaffold(
-            DistanceType::Cosine,
-            "num_neighbors=10, storage_layout = io_optimized",
-            "bq_speedup_few_neighbors",
-            1536,
-        )?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_bq_speedup_storage_delete_vacuum_plain() {
-        crate::access_method::vacuum::tests::test_delete_vacuum_plain_scaffold(
-            "num_neighbors = 10, storage_layout = io_optimized",
-        );
-    }
-
-    #[test]
-    fn test_bq_speedup_storage_delete_vacuum_full() {
-        crate::access_method::vacuum::tests::test_delete_vacuum_full_scaffold(
-            "num_neighbors = 38, storage_layout = io_optimized",
-        );
-    }
-
-    #[pg_test]
-    unsafe fn test_bq_speedup_storage_empty_table_insert() -> spi::Result<()> {
-        crate::access_method::build::tests::test_empty_table_insert_scaffold(
-            "num_neighbors=38, storage_layout = io_optimized",
-        )
-    }
-
-    #[pg_test]
-    unsafe fn test_bq_speedup_storage_insert_empty_insert() -> spi::Result<()> {
-        crate::access_method::build::tests::test_insert_empty_insert_scaffold(
-            "num_neighbors=38, storage_layout = io_optimized",
-        )
-    }
-
-    #[pg_test]
-    unsafe fn test_bq_speedup_storage_index_creation_num_dimensions_cosine() -> spi::Result<()> {
-        crate::access_method::build::tests::test_index_creation_and_accuracy_scaffold(
-            DistanceType::Cosine,
-            "storage_layout = io_optimized, num_dimensions=768",
-            "bq_speedup_num_dimensions",
-            3072,
-        )?;
-        Ok(())
-    }
-
-    #[pg_test]
-    unsafe fn test_bq_speedup_storage_index_creation_num_dimensions_l2() -> spi::Result<()> {
-        crate::access_method::build::tests::test_index_creation_and_accuracy_scaffold(
-            DistanceType::L2,
-            "storage_layout = io_optimized, num_dimensions=768",
-            "bq_speedup_num_dimensions",
-            3072,
-        )?;
-        Ok(())
-    }
-
-    #[pg_test]
-    unsafe fn test_bq_speedup_storage_index_creation_num_dimensions_ip() -> spi::Result<()> {
-        crate::access_method::build::tests::test_index_creation_and_accuracy_scaffold(
-            DistanceType::InnerProduct,
-            "storage_layout = io_optimized, num_dimensions=768",
-            "bq_speedup_num_dimensions",
-            3072,
-        )?;
-        Ok(())
-    }
-
-    #[pg_test]
-    unsafe fn test_bq_speedup_storage_index_updates_cosine() -> spi::Result<()> {
-        crate::access_method::build::tests::test_index_updates(
-            DistanceType::Cosine,
-            "storage_layout = io_optimized, num_neighbors=10",
-            300,
-            "bq_speedup",
-        )?;
-        Ok(())
-    }
-
-    #[pg_test]
-    unsafe fn test_bq_speedup_storage_index_updates_l2() -> spi::Result<()> {
-        crate::access_method::build::tests::test_index_updates(
-            DistanceType::L2,
-            "storage_layout = io_optimized, num_neighbors=10",
-            300,
-            "bq_speedup",
-        )?;
-        Ok(())
-    }
-
-    #[pg_test]
-    unsafe fn test_bq_speedup_storage_index_updates_ip() -> spi::Result<()> {
-        crate::access_method::build::tests::test_index_updates(
-            DistanceType::InnerProduct,
-            "storage_layout = io_optimized, num_neighbors=10",
-            300,
-            "bq_speedup",
-        )?;
-        Ok(())
-    }
 
     #[pg_test]
     unsafe fn test_bq_compressed_index_creation_default_neighbors() -> spi::Result<()> {
